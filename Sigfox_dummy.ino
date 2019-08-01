@@ -58,8 +58,8 @@ DHT dht(DHT_PIN, DHT_TYPE);
 unsigned long previousSendTime = 0;
 
 typedef struct __attribute__ ((packed)) data {
-  uint8_t humidity;
-  uint8_t temperature;
+  uint16_t humidity;
+  uint16_t temperature;
   uint16_t p1;
   uint16_t p2;
 };
