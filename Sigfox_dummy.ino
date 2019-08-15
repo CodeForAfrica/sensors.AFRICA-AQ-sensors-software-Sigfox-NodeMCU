@@ -98,8 +98,8 @@ void loop() {
       t = dht.readTemperature(false, true); //Read Temperature
     }
  
-  frame.humidity = convertoFloatToUInt8(h, 100);
-  frame.temperature = convertoFloatToUInt8(t, 100);
+  frame.humidity = convertoFloatToUInt16(h, 100);
+  frame.temperature = convertoFloatToUInt16(t, 100);
   
   
   sensorSDS();
