@@ -5,8 +5,8 @@
 #include <ESP8266WiFi.h>
 #include "conversions.h"
 
-#define SDS_PIN_RX D1
-#define SDS_PIN_TX D2
+#define PMS_PIN_RX D1
+#define PMS_PIN_TX D2
 
 #define DEBUG_ERROR 1
 #define DEBUG_WARNING 2
@@ -14,19 +14,21 @@
 #define DEBUG_MED_INFO 4
 #define DEBUG_MAX_INFO 5
 
-bool is_SDS_running = true;
+bool is_PMS_running = true;
 bool send_now = true;
-int sds_pm10_sum = 0;
-int sds_pm25_sum = 0;
-int sds_val_count = 0;
-int sds_pm10_max = 0;
-int sds_pm10_min = 20000;
-int sds_pm25_max = 0;
-int sds_pm25_min = 20000;
+int pms_pm10_sum = 0;
+int pms_pm25_sum = 0;
+int pms_val_count = 0;
+int pms_pm10_max = 0;
+int pms_pm10_min = 20000;
+int pms_pm25_max = 0;
+int pms_pm25_min = 20000;
 int  debug = 3;
 
-float last_value_SDS_P1 = 0;
-float last_value_SDS_P2 = 0;
+float last_value_PMS_P1 = 0;
+float last_value_PMS_P2 = 0;
+
+const unsigned long READINGTIME_PMS_MS = 5000;
 
 String esp_chipid;
 
@@ -40,18 +42,18 @@ String esp_chipid;
 #define DHT_TYPE DHT22
 #define DHT_PIN D5
 
-#define SDS_API_PIN 1
+#define PMS_API_PIN 1
 // Serial confusion: These definitions are based on SoftSerial
 // TX (transmitting) pin on one side goes to RX (receiving) pin on other side
-// SoftSerial RX PIN is D1 and goes to SDS TX
-// SoftSerial TX PIN is D2 and goes to SDS RX
-#define SDS_PIN_RX D1
-#define SDS_PIN_TX D2
+// SoftSerial RX PIN is D1 and goes to PMS TX
+// SoftSerial TX PIN is D2 and goes to PMS RX
+#define PMS_PIN_RX D1
+#define PMS_PIN_TX D2
 
 // Setup UART Communication with 
 SoftwareSerial SigFox =  SoftwareSerial(RxNodePin, TxNodePin);
 
-SoftwareSerial serialSDS(SDS_PIN_RX, SDS_PIN_TX, false, 128);
+SoftwareSerial serialPMS(PMS_PIN_RX, PMS_PIN_TX, false, 128);
 
 DHT dht(DHT_PIN, DHT_TYPE);
 
@@ -83,7 +85,7 @@ void setup() {
   delay(100);
   Serial.println("\n***** START *****");
   //initSigfox();
-  serialSDS.begin(9600);
+  serialPMS.begin(9600);
   
   
 }
@@ -102,10 +104,10 @@ void loop() {
   frame.temperature = convertoFloatToUInt16(t, 100);
   
   
-  sensorSDS();
+  fetchSensorPMS();
   
-  frame.p1 = convertoFloatToUInt16(last_value_SDS_P1, 2000);
-  frame.p2 = convertoFloatToUInt16(last_value_SDS_P2, 2000);
+  frame.p1 = convertoFloatToUInt16(last_value_PMS_P1, 2000);
+  frame.p2 = convertoFloatToUInt16(last_value_PMS_P2, 2000);
 
    if (DEBUG) {
     Serial.print("Temp \t");
@@ -210,110 +212,190 @@ bool sendSigfox(const void* data, uint8_t len){
 
 
 /*****************************************************************
-/* start SDS011 sensor                                           *
+/* start PMS5003 sensor                                          *
 /*****************************************************************/
-void start_SDS() {
-  const uint8_t start_SDS_cmd[] = {0xAA, 0xB4, 0x06, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x06, 0xAB};
-  serialSDS.write(start_SDS_cmd, sizeof(start_SDS_cmd)); is_SDS_running = true;
+void start_PMS() {
+  const uint8_t start_PMS_cmd[] = {0x42, 0x4D, 0xE4, 0x00, 0x01, 0x01, 0x74};
+  serialPMS.write(start_PMS_cmd, sizeof(start_PMS_cmd)); is_PMS_running = true;
 }
 
 /*****************************************************************
-/* stop SDS011 sensor                                            *
+/* stop PMS5003 sensor                                           *
 /*****************************************************************/
-void stop_SDS() {
-  const uint8_t stop_SDS_cmd[] = {0xAA, 0xB4, 0x06, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x05, 0xAB};
-  serialSDS.write(stop_SDS_cmd, sizeof(stop_SDS_cmd)); is_SDS_running = false;
+void stop_PMS() {
+  const uint8_t stop_PMS_cmd[] = {0x42, 0x4D, 0xE4, 0x00, 0x00, 0x01, 0x73};
+  serialPMS.write(stop_PMS_cmd, sizeof(stop_PMS_cmd)); is_PMS_running = false;
 }
 
-
-
 /*****************************************************************
-/* read SDS011 sensor values                                     *
-/*****************************************************************/
-String sensorSDS() {
-  String s = "";
-  String value_hex;
+ * read Plantronic PM sensor sensor values                       *
+ *****************************************************************/
+static void fetchSensorPMS(String &s)
+{
   char buffer;
   int value;
   int len = 0;
   int pm10_serial = 0;
   int pm25_serial = 0;
-  int checksum_is;
-  int checksum_ok = 0;
-  int position = 0;
+  int checksum_is = 0;
+  int checksum_should = 0;
+  bool checksum_ok = false;
+  int frame_len = 24; // min. frame length
 
-  Serial.println("Start reading SDS011");
-    delay(3000);
-    if (!is_SDS_running) {
-      start_SDS();
-    } 
+  debug_outln_verbose(FPSTR(DBG_TXT_START_READING), FPSTR(SENSORS_PMSx003));
+    if (!is_PMS_running)
+    {
+      start_PMS();
+    }
     delay(3000);
 
-    while (serialSDS.available() > 0) {
-      Serial.println("Inside");
-      buffer = serialSDS.read();
-      debug_out(String(len) + " - " + String(buffer, DEC) + " - " + String(buffer, HEX) + " - " + int(buffer) + " .", DEBUG_MAX_INFO, 1);
-//      "aa" = 170, "ab" = 171, "c0" = 192
+    while (serialPMS.available() > 0)
+    {
+      buffer = serialPMS.read();
+      debug_outln(String(len) + " - " + String(buffer, DEC) + " - " + String(buffer, HEX) + " - " + int(buffer) + " .", DEBUG_MAX_INFO);
+      //			"aa" = 170, "ab" = 171, "c0" = 192
       value = int(buffer);
-      switch (len) {
-      case (0): if (value != 170) { len = -1; }; break;
-      case (1): if (value != 192) { len = -1; }; break;
-      case (2): pm25_serial = value; checksum_is = value; break;
-      case (3): pm25_serial += (value << 8); checksum_is += value; break;
-      case (4): pm10_serial = value; checksum_is += value; break;
-      case (5): pm10_serial += (value << 8); checksum_is += value; break;
-      case (6): checksum_is += value; break;
-      case (7): checksum_is += value; break;
-      case (8):
-        debug_out(F("Checksum is: "), DEBUG_MED_INFO, 0); debug_out(String(checksum_is % 256), DEBUG_MED_INFO, 0);
-        debug_out(F(" - should: "), DEBUG_MED_INFO, 0); debug_out(String(value), DEBUG_MED_INFO, 1);
-        if (value == (checksum_is % 256)) { checksum_ok = 1; } else { len = -1; }; break;
-      case (9): if (value != 171) { len = -1; }; break;
+      switch (len)
+      {
+      case 0:
+        if (value != 66)
+        {
+          len = -1;
+        };
+        break;
+      case 1:
+        if (value != 77)
+        {
+          len = -1;
+        };
+        break;
+      case 2:
+        checksum_is = value;
+        break;
+      case 3:
+        frame_len = value + 4;
+        break;
+      case 10:
+        pm1_serial += (value << 8);
+        break;
+      case 11:
+        pm1_serial += value;
+        break;
+      case 12:
+        pm25_serial = (value << 8);
+        break;
+      case 13:
+        pm25_serial += value;
+        break;
+      case 14:
+        pm10_serial = (value << 8);
+        break;
+      case 15:
+        pm10_serial += value;
+        break;
+      case 22:
+        if (frame_len == 24)
+        {
+          checksum_should = (value << 8);
+        };
+        break;
+      case 23:
+        if (frame_len == 24)
+        {
+          checksum_should += value;
+        };
+        break;
+      case 30:
+        checksum_should = (value << 8);
+        break;
+      case 31:
+        checksum_should += value;
+        break;
+      }
+      if ((len > 2) && (len < (frame_len - 2)))
+      {
+        checksum_is += value;
       }
       len++;
-      if (len == 10 && checksum_ok == 1) {
-        if ((! isnan(pm10_serial)) && (! isnan(pm25_serial))) {
-          sds_pm10_sum += pm10_serial;
-          sds_pm25_sum += pm25_serial;
-          if (sds_pm10_min > pm10_serial) { sds_pm10_min = pm10_serial; }
-          if (sds_pm10_max < pm10_serial) { sds_pm10_max = pm10_serial; }
-          if (sds_pm25_min > pm25_serial) { sds_pm25_min = pm25_serial; }
-          if (sds_pm25_max < pm25_serial) { sds_pm25_max = pm25_serial; }
-          sds_val_count++;
+      if (len == frame_len)
+      {
+        debug_outln_verbose(FPSTR(DBG_TXT_CHECKSUM_IS), String(checksum_is + 143));
+        debug_outln_verbose(FPSTR(DBG_TXT_CHECKSUM_SHOULD), String(checksum_should));
+        if (checksum_should == (checksum_is + 143))
+        {
+          checksum_ok = true;
         }
-        len = 0; checksum_ok = 0; pm10_serial = 0.0; pm25_serial = 0.0; checksum_is = 0;
+        else
+        {
+          len = 0;
+        };
+        if (checksum_ok && (msSince(starttime) > (cfg::sending_intervall_ms - READINGTIME_PMS_MS)))
+        {
+          if ((!isnan(pm1_serial)) && (!isnan(pm10_serial)) && (!isnan(pm25_serial)))
+          {
+            pms_pm10_sum += pm10_serial;
+            pms_pm25_sum += pm25_serial;
+            if (pms_pm25_min > pm25_serial)
+            {
+              pms_pm25_min = pm25_serial;
+            }
+            if (pms_pm25_max < pm25_serial)
+            {
+              pms_pm25_max = pm25_serial;
+            }
+            if (pms_pm10_min > pm10_serial)
+            {
+              pms_pm10_min = pm10_serial;
+            }
+            if (pms_pm10_max < pm10_serial)
+            {
+              pms_pm10_max = pm10_serial;
+            }
+            debug_outln_verbose(F("PM2.5 (sec.): "), String(pm25_serial));
+            debug_outln_verbose(F("PM10 (sec.) : "), String(pm10_serial));
+            pms_val_count++;
+          }
+          len = 0;
+          checksum_ok = false;
+          pm10_serial = 0;
+          pm25_serial = 0;
+          checksum_is = 0;
+        }
       }
       yield();
     }
-  if (send_now) {
-    last_value_SDS_P1 = 0;
-    last_value_SDS_P2 = 0;
-    if (sds_val_count > 2) {
-      sds_pm10_sum = sds_pm10_sum - sds_pm10_min - sds_pm10_max;
-      sds_pm25_sum = sds_pm25_sum - sds_pm25_min - sds_pm25_max;
-      sds_val_count = sds_val_count - 2;
+  }
+  if (send_now)
+  {
+    last_value_PMS_P1 = -1;
+    last_value_PMS_P2 = -1;
+    if (pms_val_count > 2)
+    {
+      pms_pm10_sum = pms_pm10_sum - pms_pm10_min - pms_pm10_max;
+      pms_pm25_sum = pms_pm25_sum - pms_pm25_min - pms_pm25_max;
+      pms_val_count = pms_val_count - 2;
     }
-    if (sds_val_count > 0) {
-      
-      last_value_SDS_P1 = float(sds_pm10_sum) / (sds_val_count * 10.0);
-      last_value_SDS_P2 = float(sds_pm25_sum) / (sds_val_count * 10.0);
-      Serial.print("SDS Values \t");
-      Serial.print(last_value_SDS_P1);
-      Serial.print("\t");
-      Serial.println(last_value_SDS_P2);
-      
+    if (pms_val_count > 0)
+    {
+      last_value_PMS_P1 = float(pms_pm10_sum) / float(pms_val_count);
+      last_value_PMS_P2 = float(pms_pm25_sum) / float(pms_val_count);
+      add_Value2Json(s, F("PMS_P1"), F("PM10:  "), last_value_PMS_P1);
+      add_Value2Json(s, F("PMS_P2"), F("PM2.5: "), last_value_PMS_P2);
+      debug_outln_info(FPSTR(DBG_TXT_SEP));
     }
-    sds_pm10_sum = 0; sds_pm25_sum = 0; sds_val_count = 0;
-    sds_pm10_max = 0; sds_pm10_min = 20000; sds_pm25_max = 0; sds_pm25_min = 20000;
-     
-    stop_SDS();
+    pms_pm10_sum = 0;
+    pms_pm25_sum = 0;
+    pms_val_count = 0;
+    pms_pm10_max = 0;
+    pms_pm10_min = 20000;
+    pms_pm25_max = 0;
+    pms_pm25_min = 20000;
+    
+    stop_PMS();
   }
 
-  debug_out(F("End reading SDS011"), DEBUG_MED_INFO, 1);
-
-  return s;
+  debug_outln_verbose(FPSTR(DBG_TXT_END_READING), FPSTR(SENSORS_PMSx003));
 }
-
 
 
 /*****************************************************************

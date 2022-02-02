@@ -1,1 +1,2 @@
-Convert Temperature and R.Humidity to UInt16
+
+# Firmware for reading Particulate Matter data and sending to various end-points via Sigfox.
